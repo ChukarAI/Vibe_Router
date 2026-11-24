@@ -96,6 +96,10 @@ pub struct SqliteStore {
     /// Set on any mutation; cleared by a successful disk snapshot. Drives the
     /// portable-mode periodic flush so a clean store never touches the disk.
     dirty: Arc<AtomicBool>,
+    /// Serializes disk snapshots. The periodic portable flush and the shutdown
+    /// flush can otherwise race on the same `tmp.<pid>` path; holding this lock
+    /// for the backup+rename keeps each snapshot atomic and intact.
+    snapshot_lock: Arc<Mutex<()>>,
     path: String,
 }
 
@@ -144,6 +148,7 @@ impl SqliteStore {
             tx,
             unpriced: Arc::new(AtomicU64::new(0)),
             dirty: Arc::new(AtomicBool::new(false)),
+            snapshot_lock: Arc::new(Mutex::new(())),
             path: path_str,
         })
     }
@@ -203,6 +208,8 @@ impl SqliteStore {
     /// target so Windows never hits a sharing violation and Unix never orphans
     /// `-wal` data next to the replaced file.
     pub fn flush_to_disk(&self, disk_path: impl AsRef<Path>) -> BackendResult<()> {
+        // Serialize with any other in-flight snapshot (periodic + shutdown).
+        let _snapshot_guard = self.snapshot_lock.lock();
         let disk_path = disk_path.as_ref();
         if let Some(parent) = disk_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1036,6 +1043,42 @@ mod tests {
         assert_eq!(store.recent(10).unwrap().len(), 1);
         assert_eq!(store.totals().unwrap().requests, 1);
         assert_eq!(store.get_usage_metrics().await.unwrap().requests, 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn concurrent_snapshots_keep_the_disk_image_intact() {
+        // The periodic portable flush and the shutdown flush can overlap; both
+        // write the same `tmp.<pid>` path, so the snapshot must be serialized.
+        let dir = std::env::temp_dir().join(format!("vr-snap-conc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.db");
+        let path_str = path.to_string_lossy().into_owned();
+        let store = Arc::new(SqliteStore::open_portable(&path).unwrap());
+        store.append(record("m"));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let path = path_str.clone();
+            handles.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move { store.sync_to_disk(&path).await })
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().expect("snapshot succeeded");
+        }
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "concurrent snapshots must not corrupt the image");
+        drop(conn);
         std::fs::remove_dir_all(dir).ok();
     }
 
