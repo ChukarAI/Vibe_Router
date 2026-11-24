@@ -23,11 +23,12 @@ auto_discover_proxies = false
 # is true; disabled here so the example config never probes the network. Set
 # VIBE_LOCAL_TOKEN in the environment to authenticate against secured nodes.
 auto_discover_local = false
-# Remote model catalog (Vibe_Radar feed). When set, the router periodically
-# fetches this JSON, merges advertised models onto existing providers (keeping
-# their configured credentials), registers new public providers, and builds the
-# "daily-free" combo (alias "free") from the feed's daily_free_chain.
-# remote_catalog_url = "https://example.com/vibe-radar/catalog.json"
+# Remote model catalog (Vibe_Radar docs/catalog.json). Accepts legacy
+# providers + daily_free_chain and native provider_models + keyless_endpoints.
+# Models overlay existing providers without changing configured credentials;
+# public keyless endpoints register as radar-* providers. Builds "daily-free"
+# (alias "free") from all resolvable candidates. Disabled by default.
+# remote_catalog_url = "https://raw.githubusercontent.com/ChukarAI/Vibe_Radar/main/docs/catalog.json"
 # Refresh interval in seconds (clamped to a 30s floor). Default 900 (15 min).
 # remote_catalog_interval_secs = 900
 

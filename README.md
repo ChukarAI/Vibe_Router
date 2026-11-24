@@ -39,9 +39,10 @@ Vibe Router provides unified OpenAI (`/v1/chat/completions`) and Anthropic (`/v1
   - Responding nodes are registered as passthrough OpenAI providers (`vibe-local` for the canonical loopback node, `vibe-local-<host>` for LAN workers) and removed automatically when they stop responding.
   - Controlled by `server.auto_discover_local` (default `true`). Set `VIBE_LOCAL_TOKEN` in the environment to authenticate against secured nodes; the token is referenced as an `env:` secret and resolved at request time, never stored literally.
 - **Remote Catalog Sync & Auto-Combo (`daily-free`)**:
-  - Point `server.remote_catalog_url` at a `Vibe_Radar` JSON feed; the router refreshes it every `server.remote_catalog_interval_secs` (default 900s, 30s floor) on a bounded 15s / 2 MB budget.
-  - Advertised models are merged onto existing providers **without touching their configured endpoints or credentials**; new catalog-only providers are SSRF-guarded (public `http(s)` hosts only) and registered anonymously.
-  - The feed's `daily_free_chain` is filtered to resolvable `provider/model` entries and upserted as a runtime combo named `daily-free`, with a `free` alias registered when unset. Stale catalog providers and an empty chain are removed on the next pass.
+  - Point `server.remote_catalog_url` at Vibe Radar's `docs/catalog.json`; the router refreshes it every `server.remote_catalog_interval_secs` (default 900s, 30s floor) on a bounded 15s / 2 MB budget.
+  - Both the legacy `providers` + `daily_free_chain` shape and Radar-native `generated_at` + `provider_models` + `keyless_endpoints` shape are accepted, including mixed documents.
+  - Advertised models overlay existing providers **without touching configured endpoints or credentials**. Radar `provider_models` only augment an existing `openrouter`; tool-capable models lead its `daily-free` candidates.
+  - Public keyless endpoints become anonymous passthrough `radar-<kebab-name>` OpenAI providers; new catalog-only providers and keyless endpoints are SSRF-guarded. Candidates are deduplicated in feed order, and stale providers/overlays are removed on later syncs.
 - **Circuit Breakers & Health Probes**:
   - Per-provider circuit breaker automatically trips to `OPEN` after repeated 5xx errors or timeouts, transitions to `HALF_OPEN` for probing, and resets to `CLOSED` on success.
 - **Tagged Proxy Pools & Cloudflare Worker Relay**:
@@ -236,8 +237,9 @@ Both features are configured under `[server]` and are off-the-shelf optional:
 # Discover Vibe Local worker nodes on this PC and the LAN (UDP 20131 + HTTP 20129).
 auto_discover_local = true
 
-# Sync a Vibe_Radar model catalog and auto-build the "daily-free" combo (alias "free").
-remote_catalog_url = "https://example.com/vibe-radar/catalog.json"
+# Sync Vibe_Radar's docs/catalog.json and auto-build "daily-free" (alias "free").
+# Disabled by default; both legacy and Radar-native feed shapes are accepted.
+# remote_catalog_url = "https://raw.githubusercontent.com/ChukarAI/Vibe_Radar/main/docs/catalog.json"
 remote_catalog_interval_secs = 900   # 15 minutes; clamped to a 30s floor
 ```
 
@@ -245,11 +247,13 @@ remote_catalog_interval_secs = 900   # 15 minutes; clamped to a 30s floor
   `Authorization: Bearer` and `X-Vibe-Local-Token` on the model probe, and registered
   nodes reference it as an `env:` secret resolved at request time. It is never written
   to disk or stored literally in the registry.
-- **Catalog feed shape** (`Vibe_Radar`):
+- **Catalog feed shapes** (`Vibe_Radar`):
+
+  Legacy `RemoteCatalog` documents remain supported:
 
   ```json
   {
-    "updated_at": "2026-11-18T00:00:00Z",
+    "updated_at": "2026-11-24T00:00:00Z",
     "providers": [
       { "id": "catpub", "base_url": "https://api.catpub.example/v1/chat/completions",
         "models": [{ "id": "m1", "context": 8000 }] }
@@ -258,10 +262,31 @@ remote_catalog_interval_secs = 900   # 15 minutes; clamped to a 30s floor
   }
   ```
 
-  Existing providers keep their configured endpoint and credentials — the catalog only
-  merges new model metadata. New providers must use a public `http(s)` host (loopback,
-  link-local, and RFC1918 targets are rejected). Target the auto-built chain with the
-  model name `daily-free` or its alias `free`.
+  Radar-native `docs/catalog.json` documents use numeric `generated_at` timestamps:
+
+  ```json
+  {
+    "generated_at": 1795505461,
+    "provider_models": [
+      { "id": "inclusionai/ling-3.2-flash:free", "context_length": 131072,
+        "supports_tools": true, "claim_url": "https://openrouter.ai/models/..." }
+    ],
+    "keyless_endpoints": [
+      { "name": "Pollinations Text", "base_url": "https://text.pollinations.ai/openai",
+        "models": ["openai", "mistral"] }
+    ]
+  }
+  ```
+
+  Existing providers keep their configured endpoint and credentials. `provider_models`
+  are overlaid only when `openrouter` is already configured; they never create an
+  anonymous OpenRouter provider. Tool-capable entries are ordered first within the
+  OpenRouter group. Keyless endpoint names become deterministic `radar-<kebab-name>`
+  ids; `/v1` URLs gain `/chat/completions`, while direct endpoints are preserved.
+  New providers must use a public `http(s)` host (loopback, link-local, and RFC1918
+  targets are rejected). Legacy chain entries, OpenRouter models, and keyless models
+  are combined in that order, deduplicated, filtered to resolvable targets, and
+  upserted as `daily-free` (alias `free` when unset).
 
 ---
 

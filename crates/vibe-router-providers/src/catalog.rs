@@ -1,18 +1,21 @@
 //! Remote model-catalog synchronization (the `Vibe_Radar` feed).
 //!
-//! A catalog is a JSON document advertising providers, their models, and a
-//! `daily_free_chain` of `provider/model` entries. [`sync_remote_catalog`]
-//! fetches it on a bounded budget and reconciles it into the [`Registry`]:
+//! Both the legacy `providers` + `daily_free_chain` document and Vibe Radar's
+//! `generated_at` + `provider_models` + `keyless_endpoints` document are
+//! accepted. [`sync_remote_catalog`] fetches either shape on a bounded budget
+//! and reconciles it into the [`Registry`]:
 //!
 //!   * **Credentials are preserved.** A provider id that already exists keeps
 //!     its configured `transport` and `auth` (e.g. `env:OPENROUTER_API_KEY`);
-//!     only newly advertised models are merged onto a runtime clone.
+//!     advertised models refresh catalog-owned providers or overlay file-backed
+//!     and externally authored runtime providers.
 //!   * **New catalog-only providers are SSRF-guarded** — only public `http://`
 //!     / `https://` hosts are accepted — and registered as anonymous,
 //!     passthrough OpenAI providers.
 //!   * **Stale entries are removed** when they disappear from the feed.
 //!   * **`daily-free`** is upserted as a runtime combo from the resolvable
-//!     entries of `daily_free_chain`, with a `free` alias when unset.
+//!     legacy chain, OpenRouter free models, and keyless endpoints, with a
+//!     `free` alias when unset.
 //!
 //! Config remains the source of truth for auth and endpoints; the catalog only
 //! fills in model metadata and free-tier chains. Reads are snapshot reads, so a
@@ -20,7 +23,7 @@
 //!
 //! Depends on: vibe-router-core, vibe-router-config (via the registry).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,15 +44,22 @@ pub const DAILY_FREE_COMBO: &str = "daily-free";
 /// Alias pointing at [`DAILY_FREE_COMBO`], registered only when unset.
 pub const FREE_ALIAS: &str = "free";
 
-/// The `Vibe_Radar` catalog feed.
+/// The `Vibe_Radar` catalog feed. Legacy and Radar-native fields coexist so a
+/// mixed document remains backwards compatible.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteCatalog {
     #[serde(default)]
     pub updated_at: Option<String>,
     #[serde(default)]
+    pub generated_at: Option<serde_json::Value>,
+    #[serde(default)]
     pub providers: Vec<CatalogProvider>,
     #[serde(default)]
     pub daily_free_chain: Vec<String>,
+    #[serde(default)]
+    pub provider_models: Vec<RadarProviderModel>,
+    #[serde(default)]
+    pub keyless_endpoints: Vec<RadarKeylessEndpoint>,
 }
 
 /// A provider advertised by the catalog.
@@ -85,6 +95,44 @@ impl CatalogModel {
             capabilities: Vec::new(),
         }
     }
+}
+
+/// An OpenRouter `:free` model advertised by Vibe Radar.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RadarProviderModel {
+    pub id: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub deal_type: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
+    #[serde(default)]
+    pub claim_url: Option<String>,
+}
+
+impl RadarProviderModel {
+    fn to_spec(&self) -> ModelSpec {
+        ModelSpec {
+            id: self.id.clone(),
+            name: None,
+            context: self.context_length.and_then(|c| u32::try_from(c).ok()),
+            max_output: None,
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+/// A public keyless OpenAI-compatible endpoint advertised by Vibe Radar.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RadarKeylessEndpoint {
+    pub name: String,
+    pub base_url: String,
+    pub models: Vec<String>,
 }
 
 /// Fetch the catalog at `url` and reconcile it into `registry`. Returns the
@@ -125,15 +173,30 @@ pub async fn sync_remote_catalog(
     let catalog: RemoteCatalog =
         serde_json::from_slice(&buf).map_err(|e| format!("catalog parse failed: {e}"))?;
 
+    let previous_overlays: HashSet<String> = registry.catalog_overlay_ids().into_iter().collect();
     let mut current: HashSet<String> = HashSet::new();
+    let mut current_runtime = HashSet::new();
+    let mut current_overlays = HashSet::new();
+    let mut overlays: HashMap<String, Vec<ModelSpec>> = HashMap::new();
     for cp in &catalog.providers {
-        if registry.provider(&cp.id).is_some() {
-            // Existing provider (file or runtime): overlay only the advertised
-            // models. Its configured transport, auth, and key pool stay intact
-            // and authoritative — a config hot reload is never masked. The full
-            // advertised list is stored so repeated syncs are idempotent.
-            let specs: Vec<ModelSpec> = cp.models.iter().map(CatalogModel::to_spec).collect();
-            registry.set_catalog_models(&cp.id, specs);
+        if let Some(existing) = registry.provider(&cp.id) {
+            if (tracked_providers.contains(&cp.id) || current_runtime.contains(&cp.id))
+                && !registry.is_file_provider(&cp.id)
+            {
+                let mut refreshed = (*existing).clone();
+                refreshed.models = cp.models.iter().map(CatalogModel::to_spec).collect();
+                registry.set_runtime_provider(refreshed);
+                current_runtime.insert(cp.id.clone());
+            } else {
+                // Existing file or externally authored runtime provider: overlay
+                // only the advertised models. Configured transport, auth, and key
+                // pool stay authoritative across catalog syncs and hot reloads.
+                overlays
+                    .entry(cp.id.clone())
+                    .or_default()
+                    .extend(cp.models.iter().map(CatalogModel::to_spec));
+                current_overlays.insert(cp.id.clone());
+            }
             current.insert(cp.id.clone());
             continue;
         }
@@ -159,30 +222,116 @@ pub async fn sync_remote_catalog(
             key_pool: Arc::new(ProviderKeyPool::empty()),
         });
         current.insert(cp.id.clone());
+        current_runtime.insert(cp.id.clone());
     }
 
-    for id in tracked_providers.difference(&current) {
-        registry.remove_runtime_provider(id);
+    let openrouter_is_persistent = registry.provider("openrouter").is_some()
+        && (registry.is_file_provider("openrouter")
+            || !tracked_providers.contains("openrouter")
+            || current_runtime.contains("openrouter"));
+    if !catalog.provider_models.is_empty() && openrouter_is_persistent {
+        overlays
+            .entry("openrouter".to_string())
+            .or_default()
+            .extend(
+                catalog
+                    .provider_models
+                    .iter()
+                    .map(RadarProviderModel::to_spec),
+            );
+        current.insert("openrouter".to_string());
+        current_overlays.insert("openrouter".to_string());
+    }
+    for (id, models) in overlays {
+        registry.set_catalog_models(&id, models);
+    }
+
+    let mut keyless_candidates = Vec::new();
+    for endpoint in &catalog.keyless_endpoints {
+        let Some(slug) = radar_provider_slug(&endpoint.name) else {
+            continue;
+        };
+        let id = format!("radar-{slug}");
+        if registry.is_file_provider(&id) {
+            tracing::warn!(
+                provider = %id,
+                "catalog keyless endpoint rejected: provider id is configured in the file"
+            );
+            continue;
+        }
+        let base_url = normalize_radar_base_url(&endpoint.base_url);
+        if !catalog_url_is_safe(&base_url) {
+            tracing::warn!(
+                provider = %id,
+                "catalog keyless endpoint rejected: base_url is not a public http(s) host"
+            );
+            continue;
+        }
+        let models: Vec<ModelSpec> = endpoint
+            .models
+            .iter()
+            .map(|model| ModelSpec {
+                id: model.clone(),
+                name: None,
+                context: None,
+                max_output: None,
+                capabilities: Vec::new(),
+            })
+            .collect();
+        registry.set_runtime_provider(ConfigProvider {
+            id: id.clone(),
+            display_name: endpoint.name.clone(),
+            transport: Transport {
+                base_url,
+                format: WireFormat::OpenAi,
+                headers: Vec::new(),
+            },
+            auth: Auth::None,
+            models,
+            passthrough: true,
+            key_pool: Arc::new(ProviderKeyPool::empty()),
+        });
+        current.insert(id.clone());
+        current_runtime.insert(id.clone());
+        keyless_candidates.extend(endpoint.models.iter().map(|model| format!("{id}/{model}")));
+    }
+
+    for id in previous_overlays.difference(&current_overlays) {
         registry.remove_catalog_models(id);
     }
+    for id in tracked_providers.difference(&current_runtime) {
+        registry.remove_runtime_provider(id);
+    }
     let registered = current.len();
-    *tracked_providers = current;
+    *tracked_providers = current_runtime;
 
-    // Auto-combo from the resolvable free-tier chain.
-    let chain: Vec<String> = catalog
-        .daily_free_chain
-        .iter()
-        .filter(|entry| registry.resolve(entry).is_ok())
-        .cloned()
+    // Auto-combo from the resolvable free-tier chain. Radar tool-capable models
+    // lead the OpenRouter group while preserving feed order inside each group.
+    let mut candidates = catalog.daily_free_chain.clone();
+    for tool_capable in [true, false] {
+        candidates.extend(
+            catalog
+                .provider_models
+                .iter()
+                .filter(|entry| match tool_capable {
+                    true => entry.supports_tools == Some(true),
+                    false => entry.supports_tools != Some(true),
+                })
+                .map(|entry| format!("openrouter/{}", entry.id)),
+        );
+    }
+    candidates.extend(keyless_candidates);
+    let mut seen = HashSet::new();
+    let chain: Vec<String> = candidates
+        .into_iter()
+        .filter(|entry| seen.insert(entry.clone()) && registry.resolve(entry).is_ok())
         .collect();
     if chain.is_empty() {
         registry.remove_runtime_combo(DAILY_FREE_COMBO);
     } else {
         registry.set_runtime_combo(Combo {
             name: DAILY_FREE_COMBO.to_string(),
-            description: Some(
-                "Auto-generated from the remote catalog daily_free_chain".to_string(),
-            ),
+            description: Some("Auto-generated from the remote catalog".to_string()),
             models: chain,
             strategy: Default::default(),
         });
@@ -192,6 +341,32 @@ pub async fn sync_remote_catalog(
     }
 
     Ok(registered)
+}
+
+fn radar_provider_slug(name: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut separator = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch.to_ascii_lowercase());
+            separator = false;
+        } else if !slug.is_empty() {
+            separator = true;
+        }
+    }
+    (!slug.is_empty()).then_some(slug)
+}
+
+fn normalize_radar_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/chat/completions")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// SSRF policy for catalog-only providers: only `http`/`https` URLs whose host

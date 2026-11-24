@@ -36,7 +36,10 @@ pub mod discovery;
 pub use discovery::{discover, reconcile, scan_and_reconcile, DiscoveredNode, DiscoveryConfig};
 
 pub mod catalog;
-pub use catalog::{sync_remote_catalog, CatalogModel, CatalogProvider, RemoteCatalog};
+pub use catalog::{
+    sync_remote_catalog, CatalogModel, CatalogProvider, RadarKeylessEndpoint, RadarProviderModel,
+    RemoteCatalog,
+};
 
 #[cfg(any(test, feature = "test-mock"))]
 pub mod mock;
@@ -247,6 +250,13 @@ impl Registry {
         if self.catalog_models.write().remove(id).is_some() {
             self.remerge();
         }
+    }
+
+    /// Ids with catalog-advertised model overlays.
+    pub fn catalog_overlay_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self.catalog_models.read().keys().cloned().collect();
+        ids.sort();
+        ids
     }
 
     fn apply_catalog_overlays(&self, providers: &mut HashMap<String, Arc<ConfigProvider>>) {
