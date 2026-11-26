@@ -375,16 +375,15 @@ impl Default for StorageConfig {
 pub struct CacheConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_cache_memory_mb")]
-    pub max_memory_mb: usize,
+    /// Explicit cache capacity in MB. `None` (the default when the key is
+    /// absent) defers to the detected `HardwareProfile`; an explicit value
+    /// in TOML is always honored, even when it equals a profile default.
+    #[serde(default)]
+    pub max_memory_mb: Option<usize>,
     #[serde(default = "default_cache_ttl_secs")]
     pub ttl_seconds: u64,
     #[serde(default)]
     pub stream_cache: bool,
-}
-
-fn default_cache_memory_mb() -> usize {
-    256
 }
 
 fn default_cache_ttl_secs() -> u64 {
@@ -395,7 +394,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_memory_mb: default_cache_memory_mb(),
+            max_memory_mb: None,
             ttl_seconds: default_cache_ttl_secs(),
             stream_cache: false,
         }

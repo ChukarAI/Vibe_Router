@@ -1763,6 +1763,54 @@ async fn anthropic_messages_protocol_adapter_streaming_e2e() {
 }
 
 #[tokio::test]
+async fn anthropic_mid_stream_failure_records_502_usage_row() {
+    // One good chunk, then the upstream goes silent: the stall timeout turns
+    // that into a mid-stream StreamEvent::Error on the Anthropic path. The
+    // client response is already a 200 SSE stream, but the usage row must
+    // record 502 — matching the OpenAI streaming path — not 200.
+    let chunks = vec![sse_chunks().into_iter().next().unwrap()];
+    let mock = MockUpstream::sse_then_silence(chunks, Duration::from_secs(5)).await;
+    let mut cfg = combo_cfg(&mock.url(), &mock.url());
+    cfg.strategy.stall_timeout_ms = 300;
+    cfg.router.strategy.stall_timeout_ms = 300;
+    let (base, state) = spawn_server(&cfg).await;
+    let c = client();
+
+    let resp = c
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "good/m",
+            "messages": [{"role": "user", "content": "stream to me"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let stream_text = resp.text().await.unwrap();
+    assert!(
+        !stream_text.contains("event: message_stop"),
+        "a failed stream must not terminate cleanly: {stream_text}"
+    );
+
+    // Usage is recorded by the relay task when the stream ends; poll briefly.
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        rows = state.store.recent(10).unwrap();
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rows.len(), 1, "exactly one usage row must be recorded");
+    assert_eq!(
+        rows[0].record.status, 502,
+        "mid-stream failure on /v1/messages must record 502, not 200"
+    );
+    assert!(rows[0].record.streamed);
+}
+
+#[tokio::test]
 async fn portable_mode_zero_wear_sqlite_sync_e2e() {
     let dir = std::env::temp_dir().join(format!("vibe-router-portable-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

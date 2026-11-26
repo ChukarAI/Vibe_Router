@@ -1697,7 +1697,6 @@ dependencies = [
 name = "vibe-router-config"
 version = "0.1.0"
 dependencies = [
- "parking_lot",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

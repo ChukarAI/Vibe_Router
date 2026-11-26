@@ -427,7 +427,13 @@ pub async fn anthropic_messages(
 
                     tokio::spawn(async move {
                         let mut acc = vibe_router_translate::UsageAccumulator::new();
-                        while let Some(event) = events.recv().await {
+                        // Mirrors the OpenAI streaming path: only a stream
+                        // that terminates via [DONE] / StreamEvent::Done
+                        // counts as completed (200). A mid-stream error, an
+                        // incomplete termination, or a client disconnect
+                        // records 502.
+                        let mut completed = false;
+                        'stream: while let Some(event) = events.recv().await {
                             match event {
                                 vibe_router_core::StreamEvent::Chunk(chunk_data) => {
                                     acc.observe(&chunk_data);
@@ -438,7 +444,12 @@ pub async fn anthropic_messages(
                                         );
                                     for ev in anthropic_events {
                                         if tx.send(ev.into_bytes()).await.is_err() {
-                                            break;
+                                            // Client disconnected: stop at
+                                            // once. Breaking the loop drops
+                                            // `events`, tearing the upstream
+                                            // connection down instead of
+                                            // draining it to nowhere.
+                                            break 'stream;
                                         }
                                     }
                                 }
@@ -449,8 +460,11 @@ pub async fn anthropic_messages(
                                             &mut stream_state,
                                         );
                                     for ev in done_evs {
-                                        let _ = tx.send(ev.into_bytes()).await;
+                                        if tx.send(ev.into_bytes()).await.is_err() {
+                                            break 'stream;
+                                        }
                                     }
+                                    completed = true;
                                     break;
                                 }
                                 vibe_router_core::StreamEvent::Error(err) => {
@@ -466,7 +480,7 @@ pub async fn anthropic_messages(
                             &request_model,
                             &cand_rec,
                             &provider_echo,
-                            200,
+                            if completed { 200 } else { 502 },
                             true,
                             &final_usage,
                             started2,

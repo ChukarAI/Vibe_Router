@@ -128,12 +128,15 @@ impl Auth {
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    // No early return on length mismatch: fold over the longer input with
+    // zero padding and combine the length difference into the accumulator,
+    // so the comparison work does not short-circuit on length alone. The
+    // accumulator is usize-wide so a length delta can never alias to zero.
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }
@@ -193,11 +196,12 @@ impl AppState {
 
         let router = Arc::new(build_router(cfg, registry.clone(), health.clone()));
 
-        let cache_mb = if cfg.cache.max_memory_mb != 64 && cfg.cache.max_memory_mb != 256 {
-            cfg.cache.max_memory_mb
-        } else {
-            hardware_profile.cache_capacity_mb
-        };
+        // An explicit `cache.max_memory_mb` always wins; `None` defers to
+        // the hardware profile (e.g. 4 MB on VPS, 256 MB on workstation).
+        let cache_mb = cfg
+            .cache
+            .max_memory_mb
+            .unwrap_or(hardware_profile.cache_capacity_mb);
         let cache = Arc::new(vibe_router_cache::PromptCache::new(
             cache_mb * 1024 * 1024,
             Duration::from_secs(cfg.cache.ttl_seconds),
@@ -410,6 +414,96 @@ mod tests {
 
     fn cfg() -> AppConfig {
         AppConfig::minimal()
+    }
+
+    #[test]
+    fn ct_eq_matches_equal_keys() {
+        assert!(ct_eq(b"sk-live-secret", b"sk-live-secret"));
+        assert!(ct_eq(b"x", b"x"));
+    }
+
+    #[test]
+    fn ct_eq_rejects_same_length_mismatch() {
+        assert!(!ct_eq(b"sk-live-secret", b"sk-live-secreu"));
+        assert!(!ct_eq(b"aaaa", b"baaa"));
+    }
+
+    #[test]
+    fn ct_eq_rejects_prefix_and_different_length() {
+        // A presented key that is a prefix of the real one (or vice versa)
+        // must not match, and must be rejected by the full fold, not by an
+        // early length return.
+        assert!(!ct_eq(b"sk-live", b"sk-live-secret"));
+        assert!(!ct_eq(b"sk-live-secret", b"sk-live"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(!ct_eq(b"x", b""));
+    }
+
+    #[test]
+    fn ct_eq_empty_slices() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(&[], &[]));
+    }
+
+    #[test]
+    fn cache_max_memory_mb_toml_parsing() {
+        // Existing TOML files keep working: an explicit value parses as Some.
+        let explicit = AppConfig::parse_str("[cache]\nmax_memory_mb = 32\n").unwrap();
+        assert_eq!(explicit.cache.max_memory_mb, Some(32));
+        let explicit = AppConfig::parse_str("[cache]\nmax_memory_mb = 256\n").unwrap();
+        assert_eq!(explicit.cache.max_memory_mb, Some(256));
+        // Absent key parses as None (defer to the hardware profile).
+        let absent = AppConfig::parse_str("[cache]\n").unwrap();
+        assert_eq!(absent.cache.max_memory_mb, None);
+    }
+
+    #[tokio::test]
+    async fn explicit_cache_capacity_wins_over_vps_profile() {
+        // VPS profile default is 4 MB; an explicit max_memory_mb must be
+        // honored even when it equals another profile's default (256).
+        let mut c = cfg();
+        c.storage.sqlite_path = String::new();
+        c.server.auto_discover_proxies = false;
+        c.cache.max_memory_mb = Some(256);
+        c.router.cache = c.cache.clone();
+        let state = AppState::build(&c, Some(RuntimeProfile::Vps))
+            .await
+            .unwrap();
+        assert_eq!(state.hardware_profile.cache_capacity_mb, 4);
+        assert_eq!(
+            state.cache.stats().max_memory_bytes,
+            256 * 1024 * 1024,
+            "explicit max_memory_mb = 256 must not be replaced by the VPS profile"
+        );
+
+        // And an explicit 64 must be honored too (the old heuristic's other
+        // special case).
+        let mut c = cfg();
+        c.storage.sqlite_path = String::new();
+        c.server.auto_discover_proxies = false;
+        c.cache.max_memory_mb = Some(64);
+        c.router.cache = c.cache.clone();
+        let state = AppState::build(&c, Some(RuntimeProfile::Vps))
+            .await
+            .unwrap();
+        assert_eq!(state.cache.stats().max_memory_bytes, 64 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn absent_cache_capacity_defers_to_profile() {
+        let mut c = cfg();
+        c.storage.sqlite_path = String::new();
+        c.server.auto_discover_proxies = false;
+        c.cache.max_memory_mb = None;
+        c.router.cache = c.cache.clone();
+        let state = AppState::build(&c, Some(RuntimeProfile::Vps))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.cache.stats().max_memory_bytes,
+            4 * 1024 * 1024,
+            "None must defer to the VPS profile's 4 MB cache capacity"
+        );
     }
 
     #[test]
