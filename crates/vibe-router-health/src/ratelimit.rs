@@ -138,17 +138,9 @@ impl Default for FixedWindowRpm {
     }
 }
 
-/// Extension point for later: provider-reported limits observed at runtime
-/// (e.g. `x-ratelimit-remaining` headers).
-///
-/// Deliberately not implemented in v0.1. When it exists, the configured limit
-/// becomes a floor and observations refine it.
-pub enum ObservedLimit {
-    /// Requests remaining in the current window, as reported by the provider.
-    Remaining(u32),
-    /// When the provider says the window resets.
-    ResetsAt(Instant),
-}
+// Provider-reported limits observed at runtime live in
+// `crate::ObservedLimit` (see `observed.rs`): the configured limit stays
+// the floor and header observations refine pacing and cooldowns.
 
 #[cfg(test)]
 mod tests {

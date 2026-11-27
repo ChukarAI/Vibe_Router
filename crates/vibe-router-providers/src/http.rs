@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -26,6 +26,7 @@ use vibe_router_core::{
     Auth, HeaderScheme, SecretRef, StreamEvent, TransportError, TransportErrorKind, UpstreamClient,
     UpstreamRequest, UpstreamResponse, Usage, WireFormat,
 };
+use vibe_router_health::{HealthState, ObservedLimit, MAX_OBSERVED_COOLDOWN_MS};
 use vibe_router_translate::SseDecoder;
 
 use crate::proxy::{ProxyEntry, ProxyTag};
@@ -40,6 +41,10 @@ pub struct HttpUpstream {
     registry: Arc<Registry>,
     /// Per-proxy-URL clients (reqwest binds a proxy at client build time).
     proxy_clients: Mutex<HashMap<String, reqwest::Client>>,
+    /// Health tracker that receives provider-reported rate limits
+    /// (`ObservedLimit`) and proactive pacing cooldowns. Optional so the
+    /// transport stays usable standalone (tests, tooling).
+    health: Option<Arc<HealthState>>,
 }
 
 impl HttpUpstream {
@@ -52,7 +57,40 @@ impl HttpUpstream {
             client,
             registry,
             proxy_clients: Mutex::new(HashMap::new()),
+            health: None,
         }
+    }
+
+    /// Wire the shared health tracker: upstream rate-limit headers are
+    /// recorded into it, and single-key providers are paced through it.
+    pub fn with_health(mut self, health: Arc<HealthState>) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    /// Parse rate-limit headers off a response and record the observation
+    /// into health (when wired). Returns the parsed limit for the caller's
+    /// own cooldown decisions (key pool pacing / 429 hints).
+    fn observe_headers(
+        &self,
+        req: &UpstreamRequest,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Option<ObservedLimit> {
+        let pairs: Vec<(String, String)> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let observed = ObservedLimit::from_headers(
+            pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+            now_ms(),
+        )?;
+        if let Some(health) = &self.health {
+            health.record_observed_limit(
+                &format!("{}/{}", req.provider_id, req.model),
+                observed.clone(),
+            );
+        }
+        Some(observed)
     }
 
     /// A client bound to a forward proxy, cached per URL. Falls back to the
@@ -186,31 +224,40 @@ impl HttpUpstream {
         url: &str,
         relay_target: Option<&str>,
         format: WireFormat,
-    ) -> UpstreamResponse {
+    ) -> (UpstreamResponse, Option<ObservedLimit>) {
         let builder = match self.build_request(client, req, key, url, relay_target) {
             Ok(b) => b,
-            Err(e) => return UpstreamResponse::Transport(e),
+            Err(e) => return (UpstreamResponse::Transport(e), None),
         };
         let sent = tokio::time::timeout(req.connect_timeout, builder.send()).await;
         let response = match sent {
             Err(_) => {
-                return UpstreamResponse::Transport(transport(
-                    TransportErrorKind::Timeout,
-                    "upstream did not return response headers in time",
-                ))
+                return (
+                    UpstreamResponse::Transport(transport(
+                        TransportErrorKind::Timeout,
+                        "upstream did not return response headers in time",
+                    )),
+                    None,
+                )
             }
-            Ok(Err(e)) => return UpstreamResponse::Transport(map_reqwest_error(&e)),
+            Ok(Err(e)) => return (UpstreamResponse::Transport(map_reqwest_error(&e)), None),
             Ok(Ok(r)) => r,
         };
         let status = response.status().as_u16();
+        // Rate-limit headers ride on 2xx and 429 alike; capture them before
+        // the body is consumed.
+        let observed = self.observe_headers(req, response.headers());
         let text = match tokio::time::timeout(req.connect_timeout, response.text()).await {
             Err(_) => {
-                return UpstreamResponse::Transport(transport(
-                    TransportErrorKind::Timeout,
-                    "upstream stalled while sending the response body",
-                ))
+                return (
+                    UpstreamResponse::Transport(transport(
+                        TransportErrorKind::Timeout,
+                        "upstream stalled while sending the response body",
+                    )),
+                    observed,
+                )
             }
-            Ok(Err(e)) => return UpstreamResponse::Transport(map_reqwest_error(&e)),
+            Ok(Err(e)) => return (UpstreamResponse::Transport(map_reqwest_error(&e)), observed),
             Ok(Ok(t)) => t,
         };
         let body: serde_json::Value = match serde_json::from_str(&text) {
@@ -223,19 +270,25 @@ impl HttpUpstream {
         if (200..300).contains(&status) && format == WireFormat::Anthropic {
             let converted = vibe_router_translate::anthropic_to_openai_response(&body, &req.model);
             let usage = extract_usage(&converted);
-            return UpstreamResponse::Json {
-                status,
-                body: converted,
-                usage,
-            };
+            return (
+                UpstreamResponse::Json {
+                    status,
+                    body: converted,
+                    usage,
+                },
+                observed,
+            );
         }
 
         let usage = extract_usage(&body);
-        UpstreamResponse::Json {
-            status,
-            body,
-            usage,
-        }
+        (
+            UpstreamResponse::Json {
+                status,
+                body,
+                usage,
+            },
+            observed,
+        )
     }
 
     async fn execute_stream(
@@ -246,22 +299,28 @@ impl HttpUpstream {
         url: &str,
         relay_target: Option<&str>,
         format: WireFormat,
-    ) -> UpstreamResponse {
+    ) -> (UpstreamResponse, Option<ObservedLimit>) {
         let builder = match self.build_request(client, req, key, url, relay_target) {
             Ok(b) => b,
-            Err(e) => return UpstreamResponse::Transport(e),
+            Err(e) => return (UpstreamResponse::Transport(e), None),
         };
         let response = match tokio::time::timeout(req.connect_timeout, builder.send()).await {
             Err(_) => {
-                return UpstreamResponse::Transport(transport(
-                    TransportErrorKind::Timeout,
-                    "upstream did not return response headers in time",
-                ))
+                return (
+                    UpstreamResponse::Transport(transport(
+                        TransportErrorKind::Timeout,
+                        "upstream did not return response headers in time",
+                    )),
+                    None,
+                )
             }
-            Ok(Err(e)) => return UpstreamResponse::Transport(map_reqwest_error(&e)),
+            Ok(Err(e)) => return (UpstreamResponse::Transport(map_reqwest_error(&e)), None),
             Ok(Ok(r)) => r,
         };
         let status = response.status().as_u16();
+        // Headers are complete at this point on both the streaming (2xx)
+        // and pre-stream error paths; observe before the body moves.
+        let observed = self.observe_headers(req, response.headers());
         if !(200..300).contains(&status) {
             // An error before the first byte: bound the body read, then classify.
             let text = match tokio::time::timeout(req.connect_timeout, response.text()).await {
@@ -272,11 +331,14 @@ impl HttpUpstream {
                 Ok(v) => v,
                 Err(_) => serde_json::Value::String(truncate_text(&text)),
             };
-            return UpstreamResponse::Json {
-                status,
-                body,
-                usage: None,
-            };
+            return (
+                UpstreamResponse::Json {
+                    status,
+                    body,
+                    usage: None,
+                },
+                observed,
+            );
         }
 
         let (tx, rx) = mpsc::channel(STREAM_BUFFER);
@@ -288,7 +350,7 @@ impl HttpUpstream {
             format,
             req.model.clone(),
         ));
-        UpstreamResponse::Stream { status, events: rx }
+        (UpstreamResponse::Stream { status, events: rx }, observed)
     }
 }
 
@@ -297,6 +359,43 @@ impl HttpUpstream {
 /// non-streaming and streaming paths.
 fn is_rate_limited(resp: &UpstreamResponse) -> bool {
     matches!(resp, UpstreamResponse::Json { status: 429, .. })
+}
+
+/// A response that counts as the upstream serving the request: a 2xx JSON
+/// body or an opened stream.
+fn is_success(resp: &UpstreamResponse) -> bool {
+    match resp {
+        UpstreamResponse::Json { status, .. } => (200..300).contains(status),
+        UpstreamResponse::Stream { .. } => true,
+        UpstreamResponse::Transport(_) => false,
+    }
+}
+
+/// The proactive cooldown implied by an observation: the window is
+/// exhausted (`remaining_requests == 0`) and the provider named a positive
+/// reset/retry delay. The delay is clamped to
+/// `[100ms, MAX_OBSERVED_COOLDOWN_MS]` — long enough to matter, never long
+/// enough to brick a key. Anything else (no headers, remaining > 0, no or
+/// zero hint) yields `None`: zero behavioral impact.
+fn proactive_cooldown(observed: Option<&ObservedLimit>) -> Option<Duration> {
+    let observed = observed?;
+    if observed.remaining_requests != Some(0) {
+        return None;
+    }
+    let hint_ms = observed.cooldown_hint_ms()?;
+    if hint_ms == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(
+        hint_ms.clamp(100, MAX_OBSERVED_COOLDOWN_MS),
+    ))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// HTTP 401/403 is a *key* fault (a dead/invalid credential), not a request
@@ -360,9 +459,19 @@ impl UpstreamClient for HttpUpstream {
         if provider.key_pool.is_empty() {
             let proxy = self.registry.proxies().select_sticky(&provider.id, None);
             let (client, url, relay) = self.route_for(proxy.as_ref(), &base_url);
-            return self
+            let (resp, observed) = self
                 .run_once(&client, &req, None, &url, relay.as_deref(), format)
                 .await;
+            // Single-key pacing: there is no other key to rotate to, so an
+            // exhausted window paces the *model* through health instead —
+            // the router's wait-and-retry then honors the reset without
+            // changing single-key retry semantics.
+            if is_success(&resp) {
+                if let Some(cooldown) = proactive_cooldown(observed.as_ref()) {
+                    self.pace_model(&req, cooldown);
+                }
+            }
+            return resp;
         }
 
         // Multi-key pool: try healthy keys in order, each through its sticky
@@ -389,7 +498,7 @@ impl UpstreamClient for HttpUpstream {
                 .proxies()
                 .select_sticky(&secret_identifier(&secret_ref), None);
             let (client, url, relay) = self.route_for(proxy.as_ref(), &base_url);
-            let resp = self
+            let (resp, observed) = self
                 .run_once(
                     &client,
                     &req,
@@ -402,10 +511,18 @@ impl UpstreamClient for HttpUpstream {
             provider.key_pool.release_in_flight(idx);
 
             if is_rate_limited(&resp) {
-                provider.key_pool.mark_cooldown(idx, None);
+                // Server-guided cooldown: when the 429 carries a valid
+                // Retry-After / reset hint, wait at least that long
+                // (capped) instead of under-waiting and hammering.
+                let hint = observed
+                    .as_ref()
+                    .and_then(|o| o.cooldown_hint_ms())
+                    .map(Duration::from_millis);
+                provider.key_pool.mark_cooldown_hinted(idx, hint);
                 tracing::warn!(
                     provider = %provider.id,
                     key_index = idx,
+                    server_hint = ?hint,
                     "upstream 429: key cooled down, retrying with next key"
                 );
                 last_key_error = Some(resp);
@@ -427,10 +544,27 @@ impl UpstreamClient for HttpUpstream {
 
             // Only a 2xx resets the key's cooldown/backoff; a 5xx or a
             // request-scoped 4xx must not clear it.
-            if matches!(&resp, UpstreamResponse::Json { status, .. } if (200..300).contains(status))
-                || matches!(&resp, UpstreamResponse::Stream { .. })
-            {
+            if is_success(&resp) {
                 provider.key_pool.mark_success(idx);
+                // Proactive exhaustion rotation: the response succeeded
+                // but its headers say this key's window is now empty until
+                // the reset. Cool *this key* so the next request rotates
+                // immediately instead of colliding with a guaranteed 429.
+                // With no healthy alternative key, pace the model through
+                // health instead of stranding the only key.
+                if let Some(cooldown) = proactive_cooldown(observed.as_ref()) {
+                    if provider.key_pool.has_healthy_except(&[idx]) {
+                        provider.key_pool.mark_proactive_cooldown(idx, cooldown);
+                        tracing::info!(
+                            provider = %provider.id,
+                            key_index = idx,
+                            cooldown_ms = cooldown.as_millis() as u64,
+                            "upstream window exhausted (remaining=0): key proactively cooled"
+                        );
+                    } else {
+                        self.pace_model(&req, cooldown);
+                    }
+                }
             }
             return resp;
         }
@@ -438,6 +572,14 @@ impl UpstreamClient for HttpUpstream {
 }
 
 impl HttpUpstream {
+    /// Pace a `provider/model` through the health tracker (single-key
+    /// providers have no pool to rotate within).
+    fn pace_model(&self, req: &UpstreamRequest, cooldown: Duration) {
+        if let Some(health) = &self.health {
+            health.apply_observed_cooldown(&format!("{}/{}", req.provider_id, req.model), cooldown);
+        }
+    }
+
     async fn run_once(
         &self,
         client: &reqwest::Client,
@@ -446,7 +588,7 @@ impl HttpUpstream {
         url: &str,
         relay_target: Option<&str>,
         format: WireFormat,
-    ) -> UpstreamResponse {
+    ) -> (UpstreamResponse, Option<ObservedLimit>) {
         if req.stream {
             self.execute_stream(client, req, key, url, relay_target, format)
                 .await

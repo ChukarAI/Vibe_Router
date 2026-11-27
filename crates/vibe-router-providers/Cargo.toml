@@ -15,6 +15,7 @@ test-mock = []
 [dependencies]
 vibe-router-core = { path = "../vibe-router-core" }
 vibe-router-config = { path = "../vibe-router-config" }
+vibe-router-health = { path = "../vibe-router-health" }
 vibe-router-translate = { path = "../vibe-router-translate" }
 
 reqwest = { version = "0.12", default-features = false, features = [

@@ -1721,6 +1721,7 @@ version = "0.1.0"
 dependencies = [
  "parking_lot",
  "serde",
+ "serde_json",
  "tokio",
  "vibe-router-core",
 ]
@@ -1740,6 +1741,7 @@ dependencies = [
  "url",
  "vibe-router-config",
  "vibe-router-core",
+ "vibe-router-health",
  "vibe-router-translate",
 ]
 

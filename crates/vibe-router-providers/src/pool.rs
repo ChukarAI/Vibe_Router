@@ -223,6 +223,49 @@ impl ProviderKeyPool {
         }
     }
 
+    /// Mark a key in cooldown after a 429, honoring the server's own hint
+    /// (`Retry-After` / rate-limit reset) when it asks for a *longer* wait
+    /// than our default backoff: the base becomes
+    /// `max(default_cooldown, hint)`, repeated 429s still back off
+    /// exponentially, and the total is capped at
+    /// [`vibe_router_health::MAX_OBSERVED_COOLDOWN_MS`] so a hostile hint
+    /// cannot brick the key. A missing or shorter hint preserves the
+    /// existing behavior exactly.
+    pub fn mark_cooldown_hinted(&self, idx: usize, hint: Option<Duration>) {
+        let mut slots = self.slots.lock();
+        if let Some(slot) = slots.get_mut(idx) {
+            let base = match hint {
+                Some(h) if h > self.default_cooldown => h,
+                _ => self.default_cooldown,
+            };
+            slot.consecutive_429s = slot.consecutive_429s.saturating_add(1);
+            let shift = (slot.consecutive_429s.saturating_sub(1)).min(6);
+            let factor = 1u32 << shift;
+            let cap = Duration::from_millis(vibe_router_health::MAX_OBSERVED_COOLDOWN_MS);
+            let exp_dur = (base * factor).min(cap);
+            slot.cooldown_until = Some(Instant::now() + exp_dur);
+            slot.total_429s += 1;
+        }
+    }
+
+    /// Proactively cool a key after a *successful* response whose headers
+    /// report the provider window is exhausted (`remaining == 0`) until its
+    /// stated reset. This is pacing, not punishment: it does not count as a
+    /// 429 and does not touch the exponential-backoff state, so the key
+    /// returns at full standing when the window resets.
+    pub fn mark_proactive_cooldown(&self, idx: usize, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        let until = Instant::now() + duration;
+        let mut slots = self.slots.lock();
+        if let Some(slot) = slots.get_mut(idx) {
+            if slot.cooldown_until.is_none_or(|t| t < until) {
+                slot.cooldown_until = Some(until);
+            }
+        }
+    }
+
     /// Mark a key as succeeded, clearing pending cooldown and resetting consecutive 429 backoff.
     pub fn mark_success(&self, idx: usize) {
         let mut slots = self.slots.lock();
@@ -420,6 +463,52 @@ mod tests {
         // Over 16 requests: heavy=12, light=4.
         assert_eq!(counts[0], 12);
         assert_eq!(counts[1], 4);
+    }
+
+    #[test]
+    fn test_hinted_cooldown_honors_longer_server_hint() {
+        let keys = vec![SecretRef::Literal("k".into())];
+        let pool = ProviderKeyPool::new(keys, KeySelectionStrategy::RoundRobin);
+        // Default base is 60s; a 300s server hint must win.
+        pool.mark_cooldown_hinted(0, Some(Duration::from_secs(300)));
+        let cd = pool.earliest_cooldown().unwrap().as_secs();
+        assert!((295..=300).contains(&cd), "hint respected, got {cd}");
+    }
+
+    #[test]
+    fn test_hinted_cooldown_ignores_shorter_hint_and_caps() {
+        let keys = vec![SecretRef::Literal("k".into())];
+        let pool = ProviderKeyPool::new(keys, KeySelectionStrategy::RoundRobin);
+        // A 1s hint must not shrink the default 60s backoff.
+        pool.mark_cooldown_hinted(0, Some(Duration::from_secs(1)));
+        let cd = pool.earliest_cooldown().unwrap().as_secs();
+        assert!((55..=60).contains(&cd), "default floor kept, got {cd}");
+
+        // A 1-hour hint is capped at MAX_OBSERVED_COOLDOWN_MS (600s).
+        let pool2 = ProviderKeyPool::new(
+            vec![SecretRef::Literal("k".into())],
+            KeySelectionStrategy::RoundRobin,
+        );
+        pool2.mark_cooldown_hinted(0, Some(Duration::from_secs(3600)));
+        let cd = pool2.earliest_cooldown().unwrap().as_secs();
+        assert!((595..=600).contains(&cd), "hint capped at 600s, got {cd}");
+    }
+
+    #[test]
+    fn test_proactive_cooldown_is_not_a_429() {
+        let keys = vec![
+            SecretRef::Literal("k1".into()),
+            SecretRef::Literal("k2".into()),
+        ];
+        let pool = ProviderKeyPool::new(keys, KeySelectionStrategy::RoundRobin);
+        pool.mark_proactive_cooldown(0, Duration::from_secs(30));
+        assert_eq!(pool.healthy_keys(), 1);
+        let slot0 = pool.slots.lock()[0].clone();
+        assert_eq!(slot0.total_429s, 0, "pacing must not count as a 429");
+        assert_eq!(slot0.consecutive_429s, 0);
+        // The other key is immediately selectable.
+        let (idx, _) = pool.select_healthy_except(&[]).unwrap();
+        assert_eq!(idx, 1);
     }
 
     #[test]

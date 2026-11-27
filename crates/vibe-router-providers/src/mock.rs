@@ -23,6 +23,9 @@ use tokio::task::JoinHandle;
 pub enum Reply {
     /// Fixed status + JSON body.
     Json(u16, String),
+    /// Fixed status + JSON body + extra response headers (e.g. rate-limit
+    /// headers for `ObservedLimit` tests).
+    JsonWithHeaders(u16, String, Vec<(String, String)>),
     /// SSE stream: `chunks` framed as chunked-encoding bodies. With
     /// `silence`, the mock hangs after sending them instead of closing
     /// (stall/first-chunk timeout territory).
@@ -89,6 +92,15 @@ impl MockUpstream {
     pub async fn json(status: u16, reason: &str, body: &str) -> Self {
         let _ = reason; // status line reason mirrors body semantics
         Self::once(Reply::Json(status, body.to_string())).await
+    }
+
+    /// One JSON reply carrying extra response headers (repeats).
+    pub async fn json_with_headers(
+        status: u16,
+        body: &str,
+        headers: Vec<(String, String)>,
+    ) -> Self {
+        Self::once(Reply::JsonWithHeaders(status, body.to_string(), headers)).await
     }
 
     /// An SSE stream of `chunks` (each an exact wire payload).
@@ -177,19 +189,11 @@ async fn run_one(mut sock: tokio::net::TcpStream, reply: Reply) -> Vec<u8> {
     let request = read_request(&mut sock).await;
     match reply {
         Reply::Json(status, body) => {
-            let reason = match status {
-                200 => "OK",
-                400 => "Bad Request",
-                401 => "Unauthorized",
-                403 => "Forbidden",
-                404 => "Not Found",
-                429 => "Too Many Requests",
-                500 => "Internal Server Error",
-                502 => "Bad Gateway",
-                503 => "Service Unavailable",
-                _ => "Status",
-            };
-            let response = http_response(status, reason, &body);
+            let response = http_response(status, reason_phrase(status), &body, &[]);
+            let _ = sock.write_all(&response).await;
+        }
+        Reply::JsonWithHeaders(status, body, headers) => {
+            let response = http_response(status, reason_phrase(status), &body, &headers);
             let _ = sock.write_all(&response).await;
         }
         Reply::Sse { chunks, silence } => {
@@ -219,12 +223,32 @@ async fn run_one(mut sock: tokio::net::TcpStream, reply: Reply) -> Vec<u8> {
     request
 }
 
-fn http_response(status: u16, reason: &str, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Status",
+    }
+}
+
+fn http_response(status: u16, reason: &str, body: &str, headers: &[(String, String)]) -> Vec<u8> {
+    let mut out = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
         body.len()
-    )
-    .into_bytes()
+    );
+    for (name, value) in headers {
+        out.push_str(&format!("{name}: {value}\r\n"));
+    }
+    out.push_str("\r\n");
+    out.push_str(body);
+    out.into_bytes()
 }
 
 /// Read until the end of headers and the advertised body. Capped so a broken

@@ -23,9 +23,11 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use vibe_router_core::{Candidate, Outcome};
 
+mod observed;
 mod ratelimit;
 
-pub use ratelimit::{FixedWindowRpm, ObservedLimit, RateLimiter, Usability};
+pub use observed::{ObservedLimit, MAX_OBSERVED_COOLDOWN_MS};
+pub use ratelimit::{FixedWindowRpm, RateLimiter, Usability};
 
 /// State of a provider's circuit breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +134,7 @@ struct Entry {
     backoff_level: u32,
     last_error: Option<LastError>,
     rpm: FixedWindowRpm,
+    observed_limit: Option<ObservedLimit>,
 }
 
 #[derive(Clone)]
@@ -317,6 +320,37 @@ impl HealthState {
         }
     }
 
+    /// Record the latest provider-reported rate limit for a
+    /// `provider/model`, replacing any previous observation. Surfaced in
+    /// [`HealthState::snapshot`] (and therefore `GET /api/health`) until a
+    /// newer observation replaces it.
+    pub fn record_observed_limit(&self, model: &str, limit: ObservedLimit) {
+        let mut g = self.inner.write();
+        let e = g.entry(model.to_string()).or_default();
+        e.observed_limit = Some(limit);
+    }
+
+    /// The latest observed limit for a model, if any was ever recorded.
+    pub fn observed_limit(&self, model: &str) -> Option<ObservedLimit> {
+        self.inner.read().get(model)?.observed_limit.clone()
+    }
+
+    /// Cool a model down until `now + duration` without touching its error
+    /// or backoff state. Used for proactive pacing: the upstream said its
+    /// window is exhausted and named the reset, so waiting is information,
+    /// not failure. A shorter existing cooldown is extended, never shrunk.
+    pub fn apply_observed_cooldown(&self, model: &str, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        let until = Instant::now() + duration;
+        let mut g = self.inner.write();
+        let e = g.entry(model.to_string()).or_default();
+        if e.cooldown_until.is_none_or(|t| t < until) {
+            e.cooldown_until = Some(until);
+        }
+    }
+
     /// Record provider latency in milliseconds.
     pub fn record_provider_latency(&self, provider: &str, latency_ms: u64) {
         let mut cg = self.circuits.write();
@@ -396,6 +430,7 @@ impl HealthState {
                 rpm_used: e.rpm.used(),
                 rpm_limit: e.rpm.limit(),
                 last_error: e.last_error.clone(),
+                observed_limit: e.observed_limit.clone(),
             })
             .collect()
     }
@@ -432,6 +467,9 @@ pub struct ModelHealth {
     pub rpm_used: u32,
     pub rpm_limit: u32,
     pub last_error: Option<LastError>,
+    /// Latest provider-reported rate limit for this model, when the
+    /// upstream has ever sent rate-limit headers.
+    pub observed_limit: Option<ObservedLimit>,
 }
 
 impl ModelHealth {
@@ -616,6 +654,62 @@ mod tests {
             ),
         );
         std::thread::sleep(Duration::from_millis(80));
+        assert!(h.reserve("p/m").is_ready());
+    }
+
+    #[test]
+    fn observed_limit_recorded_and_surfaced_in_snapshot() {
+        let h = HealthState::default();
+        let limit = ObservedLimit::from_headers(
+            vec![
+                ("x-ratelimit-limit-requests", "100"),
+                ("x-ratelimit-remaining-requests", "0"),
+                ("x-ratelimit-reset-requests", "30s"),
+            ],
+            1_795_780_800_000,
+        )
+        .unwrap();
+        h.record_observed_limit("p/m", limit.clone());
+        assert_eq!(h.observed_limit("p/m"), Some(limit));
+        assert_eq!(h.observed_limit("p/never-seen"), None);
+
+        let snap = h.snapshot();
+        let entry = snap.iter().find(|s| s.model == "p/m").unwrap();
+        assert_eq!(
+            entry.observed_limit.as_ref().unwrap().remaining_requests,
+            Some(0)
+        );
+        assert_eq!(
+            entry.observed_limit.as_ref().unwrap().reset_after_ms,
+            Some(30_000)
+        );
+        // A model with no observation reports None (API omits the field).
+        h.record("p/other", Outcome::Success);
+        let other = h
+            .snapshot()
+            .into_iter()
+            .find(|s| s.model == "p/other")
+            .unwrap();
+        assert!(other.observed_limit.is_none());
+    }
+
+    #[test]
+    fn observed_cooldown_paces_without_error_state() {
+        let h = HealthState::new(Duration::from_secs(10), Duration::from_secs(60));
+        h.apply_observed_cooldown("p/m", Duration::from_millis(40));
+        assert!(matches!(h.reserve("p/m"), Usability::Cooldown(_)));
+        let snap = h.snapshot();
+        let entry = snap.iter().find(|s| s.model == "p/m").unwrap();
+        assert!(entry.is_cooling());
+        assert!(
+            entry.last_error.is_none(),
+            "proactive pacing is not a failure"
+        );
+        assert_eq!(entry.backoff_level, 0);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(h.reserve("p/m").is_ready());
+        // Zero duration is a no-op.
+        h.apply_observed_cooldown("p/m", Duration::ZERO);
         assert!(h.reserve("p/m").is_ready());
     }
 

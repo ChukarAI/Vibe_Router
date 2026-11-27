@@ -1202,6 +1202,169 @@ async fn provider_key_pool_rotates_and_survives_429() {
     assert!(r2.contains("Bearer sk-key-2"), "{r2}");
 }
 
+// ---------------------------------------------------------------- ObservedLimit
+
+#[tokio::test]
+async fn proactive_rotation_on_remaining_zero_e2e() {
+    // Request 1 succeeds on key 1, but its headers say the window is now
+    // exhausted for 30s. Request 2 must rotate to key 2 *proactively* —
+    // without ever provoking a 429.
+    let mut mock = MockUpstream::sequence(vec![
+        Reply::JsonWithHeaders(
+            200,
+            OK_BODY.into(),
+            vec![
+                ("x-ratelimit-limit-requests".into(), "10".into()),
+                ("x-ratelimit-remaining-requests".into(), "0".into()),
+                ("x-ratelimit-reset-requests".into(), "30s".into()),
+            ],
+        ),
+        Reply::Json(200, OK_BODY.into()),
+    ])
+    .await;
+    let (base, _state) = spawn_server(&pooled_cfg(&mock.url(), vec!["sk-key-1", "sk-key-2"])).await;
+    let c = client();
+
+    for i in 0..2 {
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "good/m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "request {i} must succeed");
+    }
+
+    assert_eq!(
+        mock.wait_for_requests(2).await,
+        2,
+        "exactly two upstream calls: rotation was proactive, no 429 retry"
+    );
+    let r1 = mock.request_text(0).await;
+    let r2 = mock.request_text(1).await;
+    assert!(r1.contains("Bearer sk-key-1"), "{r1}");
+    assert!(
+        r2.contains("Bearer sk-key-2"),
+        "second request must rotate to key 2: {r2}"
+    );
+}
+
+#[tokio::test]
+async fn server_guided_429_cooldown_e2e() {
+    // A 429 carrying Retry-After: 120 — the key's cooldown must honor the
+    // server hint (recorded verbatim in health), and rotation must not
+    // swing back to the hinted key on the next request.
+    let mut mock = MockUpstream::sequence(vec![
+        Reply::JsonWithHeaders(
+            429,
+            r#"{"error":{"message":"rate limit"}}"#.into(),
+            vec![("retry-after".into(), "120".into())],
+        ),
+        Reply::Json(200, OK_BODY.into()),
+    ])
+    .await;
+    let (base, state) = spawn_server(&pooled_cfg(&mock.url(), vec!["sk-key-1", "sk-key-2"])).await;
+    let c = client();
+
+    for i in 0..2 {
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "good/m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "request {i} succeeds via rotation");
+    }
+
+    // Upstream calls: key1 (429) -> key2 (200) -> key2 again (key1 cooling).
+    mock.wait_for_requests(3).await;
+    let r3 = mock.request_text(2).await;
+    assert!(
+        r3.contains("Bearer sk-key-2"),
+        "hinted key must stay out of rotation: {r3}"
+    );
+
+    // The observation itself is in health with the hint parsed + clamped.
+    let observed = state
+        .health
+        .observed_limit("good/m")
+        .expect("429 headers must be recorded");
+    assert_eq!(observed.retry_after_ms, Some(120_000));
+}
+
+#[tokio::test]
+async fn health_telemetry_observed_limit_present_and_absent_e2e() {
+    // With rate-limit headers: /api/health exposes observed_limit.
+    let mock = MockUpstream::json_with_headers(
+        200,
+        OK_BODY,
+        vec![
+            ("x-ratelimit-limit-requests".into(), "10".into()),
+            ("x-ratelimit-remaining-requests".into(), "9".into()),
+            ("x-ratelimit-reset-requests".into(), "45s".into()),
+        ],
+    )
+    .await;
+    let (base, _state) = spawn_server(&pooled_cfg(&mock.url(), vec!["sk-key-1"])).await;
+    let c = client();
+    let resp = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "good/m", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let health: serde_json::Value = c
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = health["models"].as_array().unwrap();
+    let entry = models
+        .iter()
+        .find(|m| m["model"] == "good/m")
+        .expect("good/m health entry");
+    let observed = &entry["observed_limit"];
+    assert_eq!(observed["limit_requests"], 10);
+    assert_eq!(observed["remaining_requests"], 9);
+    assert_eq!(observed["reset_after_ms"], 45_000);
+    assert!(observed["observed_at_ms"].as_u64().unwrap() > 0);
+
+    // Without any rate-limit headers: the field is omitted entirely, so
+    // existing consumers see the pre-ObservedLimit shape.
+    let plain = MockUpstream::json(200, "OK", OK_BODY).await;
+    let (base2, _s2) = spawn_server(&pooled_cfg(&plain.url(), vec!["sk-key-1"])).await;
+    let resp = c
+        .post(format!("{base2}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "good/m", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let health2: serde_json::Value = c
+        .get(format!("{base2}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry2 = health2["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] == "good/m")
+        .expect("good/m health entry");
+    assert!(
+        entry2.get("observed_limit").is_none(),
+        "no headers observed -> field omitted: {entry2}"
+    );
+}
+
 #[tokio::test]
 async fn provider_api_exposes_key_counts() {
     let mock = MockUpstream::json(200, "OK", OK_BODY).await;

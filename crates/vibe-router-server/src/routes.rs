@@ -1188,14 +1188,23 @@ pub async fn api_health(State(state): State<Arc<AppState>>) -> Response {
     let models_json: Vec<Value> = models
         .into_iter()
         .map(|m| {
-            json!({
+            let mut entry = json!({
                 "model": m.model,
                 "cooling": m.is_cooling(),
                 "backoff_level": m.backoff_level,
                 "rpm_used": m.rpm_used,
                 "rpm_limit": m.rpm_limit,
                 "last_error": m.last_error.map(|e| json!({"status": e.status})),
-            })
+            });
+            // Backwards-compatible addition: `observed_limit` appears only
+            // once the upstream has actually sent rate-limit headers for
+            // this model; consumers written before it see the old shape.
+            if let Some(observed) = &m.observed_limit {
+                if let Ok(v) = serde_json::to_value(observed) {
+                    entry["observed_limit"] = v;
+                }
+            }
+            entry
         })
         .collect();
     Json(json!({

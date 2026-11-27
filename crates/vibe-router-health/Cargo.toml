@@ -13,3 +13,6 @@ vibe-router-core = { path = "../vibe-router-core" }
 tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json.workspace = true

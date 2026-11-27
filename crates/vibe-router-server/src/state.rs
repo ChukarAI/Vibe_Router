@@ -309,7 +309,10 @@ fn build_router(cfg: &AppConfig, registry: Arc<Registry>, health: Arc<HealthStat
         &cfg.strategy,
         cfg.router.error_rules.clone(),
     ));
-    let upstream = Arc::new(HttpUpstream::new(registry.clone()));
+    // The transport records upstream rate-limit observations into the same
+    // health tracker the router consults, and paces single-key providers
+    // through it.
+    let upstream = Arc::new(HttpUpstream::new(registry.clone()).with_health(health.clone()));
     Router::new(
         registry,
         health,
